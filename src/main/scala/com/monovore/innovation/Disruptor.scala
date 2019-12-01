@@ -6,14 +6,13 @@ import com.lmax.{disruptor => lmax}
 import cats.free.{Free, FreeApplicative}
 import com.monovore.innovation.event.Event
 
-case class Junk[B](sequences: List[lmax.Sequence], provider: lmax.DataProvider[B])
-
 class Key[A] {
   def read: Key.F[A] = FreeApplicative.lift(this)
 }
 
 object Key {
   type F[A] = FreeApplicative[Key, A]
+  def pure[A](a: A): F[A] = FreeApplicative.pure(a)
 }
 
 sealed trait Action[A]
@@ -41,72 +40,70 @@ object Disruptor {
 }
 
 object RingBuffer {
+
+  trait EventAndBuffer[A] {
+    type Mutable
+    val event: Event[A] { type Mutable = EventAndBuffer.this.Mutable }
+    val bufferKey: Key[lmax.RingBuffer[Mutable]]
+  }
+
+  object EventAndBuffer {
+    def apply[A](event0: Event[A])(bufferKey0: Key[lmax.RingBuffer[event0.Mutable]]): EventAndBuffer[A] =
+      new EventAndBuffer[A] {
+        override type Mutable = event0.Mutable
+        val event = event0
+        override val bufferKey: Key[lmax.RingBuffer[event0.Mutable]] = bufferKey0
+      }
+  }
+
   def allocate[A](size: Int)(implicit event: Event[A]): Disruptor[RingBuffer[A]] = {
     Disruptor(Action.allocate(size)(event))
-      .map(bufferKey =>
-        new RingBuffer[A](
-          bufferKey.read.widen[lmax.RingBuffer[_]],
-          bufferKey.read.map(buffer =>
-            idx => event.translateFrom(buffer.get(idx))
-          )
-        )
-      )
+      .map(bufferKey0 => new RingBuffer(EventAndBuffer(event)(bufferKey0)))
   }
 }
 
-class RingBuffer[A](bufferKey: Key.F[lmax.RingBuffer[_]], providerKey: Key.F[lmax.DataProvider[A]]) {
+class RingBuffer[A](private[RingBuffer] val eventAndBuffer: RingBuffer.EventAndBuffer[A]) {
 
-  def output: Handler[A] = new Handler(providerKey.map(provider => Junk(Nil, provider)))
+  import eventAndBuffer._
+
+  case class Junk[B](sequences: List[lmax.Sequence], provider: lmax.DataProvider[B])
+
+  def output: Handler[A] =
+    new Handler(bufferKey.read.map(buffer =>
+      Junk(Nil, idx => event.translateFrom(buffer.get(idx)))
+    ))
 
   class Handler[B] private[RingBuffer](private[RingBuffer] val from: Key.F[Junk[B]]) {
 
-    def run(implicit evidence: B =:= Unit): Disruptor[Handler[Unit]] = {
-
-      val processor: Key.F[lmax.EventProcessor] =
-        (bufferKey, from)
-          .mapN { case (buffer, Junk(sequences, provider))  =>
+    private[this] def process(eventHandler: Key.F[lmax.EventHandler[B]]): Disruptor[Key[lmax.Sequence]] =
+      Disruptor(Action.register(
+        (bufferKey.read, from, eventHandler)
+          .mapN { case (buffer, Junk(sequences, provider), eventHandler)  =>
             new lmax.BatchEventProcessor[B](
               provider,
               buffer.newBarrier(sequences: _*),
-              (e, _, _) => evidence(e)
+              eventHandler
             )
           }
+      ))
 
-      Disruptor(Action.register(processor))
+    def run(implicit evidence: B =:= Unit): Disruptor[Handler[Unit]] =
+      process(Key.pure((e, _, _) => evidence(e)))
         .map(sequenceKey =>
           new Handler(sequenceKey.read.map(sequence => Junk(List(sequence), _ => ())))
         )
+
+    def publishTo(other: RingBuffer[B]): Disruptor[Handler[Unit]] = {
+      for {
+        sequenceKey <- process {
+          import other.eventAndBuffer._
+          bufferKey.read.map(buffer =>
+            (e, _, _) => buffer.publishEvent(event.translator, e)
+          )
+        }
+        _ <- Disruptor(Action.addPublisher(bufferKey))
+      } yield new Handler(sequenceKey.read.map(sequence => Junk(List(sequence), _ => ())))
     }
-//
-//    def republish(implicit event: Event[B]): Disruptor[Handler[B]] = {
-//      for {
-//        downstream <- RingBuffer.allocate(event)
-//        processor = new BatchEventProcessor[B](
-//          provider,
-//          RingBuffer.this.buffer.newBarrier(sequences: _*),
-//          (e, _, _) => {
-//            downstream.buffer.publishEvent(downstream.event.translator, e)
-//          }
-//        )
-//        _ <- Disruptor(Free.liftF(Register(processor)))
-//      } yield Handler(
-//        List(processor.getSequence),
-//        x => downstream.event.translateFrom(downstream.buffer.get(x))
-//      )
-//    }
-//
-//    def publishTo(buffer: RingBuffer[B]): Disruptor[Unit] = {
-//
-//      val processor = new BatchEventProcessor[B](
-//        provider,
-//        RingBuffer.this.buffer.newBarrier(sequences: _*),
-//        (e, _, _) => {
-//          buffer.buffer.publishEvent(buffer.event.translator, e)
-//        }
-//      )
-//
-//      Disruptor(Free.liftF(Register(processor)))
-//    }
   }
 
   object Handler {
@@ -122,15 +119,6 @@ class RingBuffer[A](bufferKey: Key.F[lmax.RingBuffer[_]], providerKey: Key.F[lma
             x => ff.provider.get(x).apply(fa.provider.get(x))
           )
         })
-
-//      override def map[A, B](fa: Handler[A])(f: A => B): Handler[B] =
-//        Handler(fa.sequences, x => f(fa.provider.get(x)))
-//
-//      override def productR[A, B](fa: Handler[A])(fb: Handler[B]): Handler[B] =
-//        Handler(fa.sequences ++ fb.sequences, fb.provider)
-//
-//      override def productL[A, B](fa: Handler[A])(fb: Handler[B]): Handler[A] =
-//        Handler(fa.sequences ++ fb.sequences, fa.provider)
     }
   }
 }
