@@ -66,11 +66,33 @@ class RingBuffer[A](private[RingBuffer] val eventAndBuffer: RingBuffer.EventAndB
 
   import eventAndBuffer._
 
-  case class Junk[B](sequences: List[lmax.Sequence], provider: lmax.DataProvider[B])
+  private[this] case class Junk[B](sequences: List[lmax.Sequence], provider: lmax.DataProvider[B])
+
+  private[this] abstract class Sinking[B] {
+    private[RingBuffer] def publish(b: B): Long
+  }
+
+  class Sink[B] private[RingBuffer](private[RingBuffer] val to: Key.F[Sinking[B]])
 
   def output: Handler[A] =
     new Handler(bufferKey.read.map(buffer =>
       Junk(Nil, idx => event.translateFrom(buffer.get(idx)))
+    ))
+
+  def input: Sink[A] =
+    new Sink[A](bufferKey.read.map(buffer =>
+      new Sinking[A] {
+        override private[RingBuffer] def publish(a: A) = {
+          val next = buffer.next()
+          try {
+            val mut = buffer.get(next)
+            event.translateTo(a, mut)
+            next
+          } finally {
+            buffer.publish(next)
+          }
+        }
+      }
     ))
 
   class Handler[B] private[RingBuffer](private[RingBuffer] val from: Key.F[Junk[B]]) {
@@ -93,16 +115,42 @@ class RingBuffer[A](private[RingBuffer] val eventAndBuffer: RingBuffer.EventAndB
           new Handler(sequenceKey.read.map(sequence => Junk(List(sequence), _ => ())))
         )
 
-    def publishTo(other: RingBuffer[B]): Disruptor[Handler[Unit]] = {
+
+    /**
+     * Here's an interesting one! Let's say we want to consume from buffer A and publish some derivative data
+     * to buffer B. We then have some consumer of A that wants to block on some consumer of B!
+     *
+     *
+     *
+     * @param other
+     * @return
+     */
+    def publishTo(other: RingBuffer[B]): Disruptor[other.Handler[Unit] => Handler[Unit]] = {
       for {
+        translationBuffer <- RingBuffer.allocate[Long](128) // FIXME: preserve size!
         sequenceKey <- process {
-          import other.eventAndBuffer._
-          bufferKey.read.map(buffer =>
-            (e, _, _) => buffer.publishEvent(event.translator, e)
+
+          (other.input.to, translationBuffer.input.to).mapN((otherBuffer, offsets) =>
+            (e, _, _) => {
+              val offset = otherBuffer.publish(e)
+              offsets.publish(offset)
+            }
           )
         }
-        _ <- Disruptor(Action.addPublisher(bufferKey))
-      } yield new Handler(sequenceKey.read.map(sequence => Junk(List(sequence), _ => ())))
+        _ <- Disruptor(Action.addPublisher(other.eventAndBuffer.bufferKey))
+        _ <- Disruptor(Action.addPublisher(translationBuffer.eventAndBuffer.bufferKey))
+      } yield { otherHandler: other.Handler[Unit] =>
+
+
+        /*
+        So, what's the idea here? We're building a lookup table, a la [0 0 0 2 2 5 5 5].
+        When people retrieve the
+         */
+        new Handler[Unit](
+          this.from.map { case (sequences, _) =>
+          }
+        )
+      }
     }
   }
 
@@ -135,4 +183,15 @@ object C {
       (buffer.output <* journal <* replicate)
         .map(x => println(s"businessing $x")).run
   } yield ()
+
+  /*
+
+  for {
+    buffer <- ...
+    (republished, newBuffer) <- buffer.output.producer.flatMap(x => <xs>).republish(size = 256)
+
+  }
+
+   */
+
 }
